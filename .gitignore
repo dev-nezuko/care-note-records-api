@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+project_venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+coverage/
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# Node (none today, kept out defensively)
+node_modules/
+
+# Local configuration
+.env
+.env.*
+!.env.example
+
+# SQLite databases are generated locally and may hold note content
+*.db
+*.db-shm
+*.db-wal
+*.db-journal
+*.sqlite
+*.sqlite3
+
+# Logs and scratch
+*.log
+logs/
+tmp/
+
+# Editor and OS
+.DS_Store
+.idea/
+.vscode/
+
+# Not part of this project
+.github/
