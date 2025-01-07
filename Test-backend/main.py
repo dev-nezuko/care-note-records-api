@@ -1,5 +1,5 @@
 from fastapi import FastAPI, Depends, HTTPException, Query
-from sqlalchemy import create_engine, func, select, Index, and_, text
+from sqlalchemy import create_engine, func, insert, select, Index, and_
 from sqlalchemy.engine import URL
 import os
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
@@ -7,9 +7,12 @@ from sqlalchemy.orm import Session, DeclarativeBase, Mapped, mapped_column, sess
 from datetime import datetime, timedelta, date, timezone
 from typing import List, Optional, Dict, Any, Tuple
 import asyncio
+import logging
 import random
 import time
 from fastapi.middleware.cors import CORSMiddleware
+
+logger = logging.getLogger(__name__)
 
 # Base Models
 class Base(DeclarativeBase):
@@ -69,110 +72,79 @@ async def get_db():
 def init_db():
     Base.metadata.create_all(bind=sync_engine)
 
-# Async function to populate test data
-async def create_test_data(num_notes: int = 100000):
-    """Populate database with test care notes using efficient batch insertion."""
-    categories = ['medication', 'observation', 'treatment']
-    tenants = list(range(1, 11))  # 10 tenants
+DEMO_CATEGORIES = ('medication', 'observation', 'treatment')
+SEED_BATCH_SIZE = 1000
+
+
+async def create_test_data(num_notes: int = 1000, rng: Optional[random.Random] = None):
+    """Append ``num_notes`` fictional notes spread over the last 30 days.
+
+    All batches go through one session and one commit: a failed run leaves no
+    partial data, and SQLite syncs to disk once instead of once per batch.
+    """
+    rng = rng or random.Random()
+    now = datetime.utcnow()
+    tenants = range(1, 11)
     facilities_per_tenant = 5
     patients_per_facility = 50
 
-    batch_size = 1000
-    notes_data = []
+    logger.info("Generating %d synthetic care notes", num_notes)
+    async with async_session_maker() as session:
+        for batch_start in range(0, num_notes, SEED_BATCH_SIZE):
+            batch = []
+            for _ in range(min(SEED_BATCH_SIZE, num_notes - batch_start)):
+                tenant_id = rng.choice(tenants)
+                facility_id = tenant_id * 10 + rng.randint(1, facilities_per_tenant)
+                patient_id = f"DEMO-P{facility_id}-{rng.randint(1, patients_per_facility):02d}"
+                # Weighted towards recent days, like a live care-home log.
+                age = timedelta(days=rng.triangular(0, 30, 5))
+                batch.append({
+                    'tenant_id': tenant_id,
+                    'facility_id': facility_id,
+                    'patient_id': patient_id,
+                    'category': rng.choice(DEMO_CATEGORIES),
+                    'priority': rng.randint(1, 5),
+                    'created_at': now - age,
+                    'created_by': f"demo-carer-{rng.randint(1, 20):02d}",
+                    'note_content': f"Synthetic demo note for fictional resident {patient_id}",
+                })
+            await session.execute(insert(CareNote), batch)
+        await session.commit()
+    logger.info("Inserted %d synthetic care notes", num_notes)
 
-    # Generate timestamps for the last 30 days
-    end_date = datetime.utcnow()
-    start_date = end_date - timedelta(days=30)
 
-    print(f"Generating {num_notes} care notes...")
-
-    for i in range(num_notes):
-        tenant_id = random.choice(tenants)
-        facility_id = tenant_id * 10 + random.randint(1, facilities_per_tenant)
-        patient_id = f"P{facility_id}_{random.randint(1, patients_per_facility)}"
-
-        # Realistic timestamp distribution (more recent notes)
-        days_ago = random.triangular(0, 30, 5)
-        timestamp = end_date - timedelta(days=days_ago,
-                                       hours=random.randint(0, 23),
-                                       minutes=random.randint(0, 59))
-
-        note = {
-            'tenant_id': tenant_id,
-            'facility_id': facility_id,
-            'patient_id': patient_id,
-            'category': random.choice(categories),
-            'priority': random.randint(1, 5),
-            'created_at': timestamp,
-            'created_by': f"nurse_{random.randint(1, 20)}",
-            'note_content': f"Test care note content for patient {patient_id}"
-        }
-        notes_data.append(note)
-
-        # Batch insert
-        if len(notes_data) >= batch_size:
-            async with async_session_maker() as session:
-                await session.execute(
-                    text("""
-                    INSERT INTO care_notes (tenant_id, facility_id, patient_id, category, priority, created_at, created_by, note_content)
-                    VALUES (:tenant_id, :facility_id, :patient_id, :category, :priority, :created_at, :created_by, :note_content)
-                    """),
-                    notes_data
-                )
-                await session.commit()
-            notes_data = []
-            if (i + 1) % 10000 == 0:
-                print(f"Inserted {i + 1} notes...")
-
-    # Insert remaining notes
-    if notes_data:
-        async with async_session_maker() as session:
-            await session.execute(
-                text("""
-                INSERT INTO care_notes (tenant_id, facility_id, patient_id, category, priority, created_at, created_by, note_content)
-                VALUES (:tenant_id, :facility_id, :patient_id, :category, :priority, :created_at, :created_by, :note_content)
-                """),
-                notes_data
-            )
-            await session.commit()
-
-    print(f"Successfully inserted {num_notes} care notes!")
-
-# Original inefficient implementation
 async def get_daily_care_stats(
     db: AsyncSession,
     tenant_id: int,
     facility_ids: Optional[List[int]] = None,
-    date: Optional[datetime] = None
+    day: Optional[datetime] = None
 ):
-    if date is None:
-        date = datetime.utcnow()
+    """Benchmark baseline: load the day's notes and count them in Python.
 
-    # Current inefficient query
+    ``func.date()`` on the column also keeps SQLite from using the date index.
+    """
+    if day is None:
+        day = datetime.utcnow()
+
     base_query = select(CareNote).where(
         CareNote.tenant_id == tenant_id,
-        func.date(CareNote.created_at) == date.date()
+        func.date(CareNote.created_at) == day.date().isoformat()
     )
-
     if facility_ids:
         base_query = base_query.where(CareNote.facility_id.in_(facility_ids))
 
     notes = (await db.execute(base_query)).scalars().all()
 
-    # Inefficient in-memory processing
     stats = {
         "total_notes": len(notes),
         "by_category": {},
         "by_priority": {1: 0, 2: 0, 3: 0, 4: 0, 5: 0},
         "by_facility": {},
-        "avg_notes_per_patient": 0
     }
-
     for note in notes:
         stats["by_category"][note.category] = stats["by_category"].get(note.category, 0) + 1
-        stats["by_priority"][note.priority] += 1
+        stats["by_priority"][note.priority] = stats["by_priority"].get(note.priority, 0) + 1
         stats["by_facility"][note.facility_id] = stats["by_facility"].get(note.facility_id, 0) + 1
-
     return stats
 
 # Optimized implementation using SQL aggregations
@@ -262,86 +234,58 @@ async def get_daily_care_stats_optimized(
 
     return stats
 
-# Performance testing function
-async def run_performance_test(num_iterations: int = 10, concurrent_requests: int = 5):
-    """Compare performance of original vs optimized query."""
-    print("\n=== Performance Test Results ===\n")
+COMPARED_STAT_KEYS = ("total_notes", "by_category", "by_priority", "by_facility")
 
-    # Test parameters
-    test_tenant_id = 1
-    test_facility_ids = [11, 12, 13, 14, 15]  # Facilities for tenant 1
-    # Use a date 5 days ago to ensure we have data
-    test_date = datetime.utcnow() - timedelta(days=5)
 
-    # Test original implementation
-    print("Testing ORIGINAL implementation...")
-    original_times = []
+async def run_performance_test(num_iterations: int = 10, concurrent_requests: int = 5) -> Dict[str, Any]:
+    """Time the in-memory baseline against SQL aggregation over the same calendar day."""
+    tenant_id = 1
+    facility_ids = [11, 12, 13, 14, 15]
+    # The seeder weights notes towards five days ago, so that day has data.
+    day = datetime.utcnow() - timedelta(days=5)
+    day_start = day.replace(hour=0, minute=0, second=0, microsecond=0)
+    day_end = day.replace(hour=23, minute=59, second=59, microsecond=999999)
 
-    async def run_original():
+    async def timed(compute):
         async with async_session_maker() as db:
-            start = time.time()
-            await get_daily_care_stats(db, test_tenant_id, test_facility_ids, test_date)
-            end = time.time()
-            return end - start
+            started = time.perf_counter()
+            result = await compute(db)
+            return time.perf_counter() - started, result
 
-    # Sequential test for original
-    for i in range(num_iterations):
-        exec_time = await run_original()
-        original_times.append(exec_time)
+    async def in_memory(db):
+        return await get_daily_care_stats(db, tenant_id, facility_ids, day)
 
-    # Concurrent test for original
-    concurrent_original_start = time.time()
-    tasks = [run_original() for _ in range(concurrent_requests)]
-    await asyncio.gather(*tasks)
-    concurrent_original_time = time.time() - concurrent_original_start
+    async def sql_aggregate(db):
+        return await get_daily_care_stats_optimized(db, tenant_id, facility_ids, day_start, day_end)
 
-    # Test optimized implementation
-    print("\nTesting OPTIMIZED implementation...")
-    optimized_times = []
+    async def measure(compute):
+        sequential = [await timed(compute) for _ in range(num_iterations)]
+        started = time.perf_counter()
+        await asyncio.gather(*(timed(compute) for _ in range(concurrent_requests)))
+        concurrent_total = time.perf_counter() - started
+        average = sum(elapsed for elapsed, _ in sequential) / num_iterations
+        return average, concurrent_total, sequential[0][1]
 
-    async def run_optimized():
-        async with async_session_maker() as db:
-            start = time.time()
-            await get_daily_care_stats_optimized(db, test_tenant_id, test_facility_ids, test_date, test_date)
-            end = time.time()
-            return end - start
+    baseline_avg, baseline_concurrent, baseline_stats = await measure(in_memory)
+    sql_avg, sql_concurrent, sql_stats = await measure(sql_aggregate)
 
-    # Sequential test for optimized
-    for i in range(num_iterations):
-        exec_time = await run_optimized()
-        optimized_times.append(exec_time)
-
-    # Concurrent test for optimized
-    concurrent_optimized_start = time.time()
-    tasks = [run_optimized() for _ in range(concurrent_requests)]
-    await asyncio.gather(*tasks)
-    concurrent_optimized_time = time.time() - concurrent_optimized_start
-
-    # Calculate metrics
-    avg_original = sum(original_times) / len(original_times)
-    avg_optimized = sum(optimized_times) / len(optimized_times)
-    improvement = ((avg_original - avg_optimized) / avg_original) * 100
-
-    # Get sample stats to show record count
-    async with async_session_maker() as db:
-        sample_stats = await get_daily_care_stats(db, test_tenant_id, test_facility_ids, test_date)
-        print(f"\nProcessing {sample_stats['total_notes']} records for date: {test_date.date()}")
-
-    # Print results
-    print("\n--- Sequential Performance ---")
-    print(f"Original avg time: {avg_original:.4f}s")
-    print(f"Optimized avg time: {avg_optimized:.4f}s")
-    print(f"Performance improvement: {improvement:.1f}%")
-    print(f"Speed up: {avg_original/avg_optimized:.2f}x faster")
-
-    print("\n--- Concurrent Performance ---")
-    print(f"Original ({concurrent_requests} concurrent): {concurrent_original_time:.4f}s")
-    print(f"Optimized ({concurrent_requests} concurrent): {concurrent_optimized_time:.4f}s")
-    print(f"Concurrent improvement: {((concurrent_original_time - concurrent_optimized_time) / concurrent_original_time * 100):.1f}%")
-
-    print("\n--- Resource Efficiency ---")
-    print(f"Original: Loads all records into memory")
-    print(f"Optimized: SQL aggregation (minimal memory usage)")
+    return {
+        "tenant_id": tenant_id,
+        "facility_ids": facility_ids,
+        "day": day_start.date().isoformat(),
+        "notes_in_window": sql_stats["total_notes"],
+        "results_match": all(baseline_stats[key] == sql_stats[key] for key in COMPARED_STAT_KEYS),
+        "sequential": {
+            "iterations": num_iterations,
+            "in_memory_avg_ms": round(baseline_avg * 1000, 3),
+            "sql_aggregate_avg_ms": round(sql_avg * 1000, 3),
+        },
+        "concurrent": {
+            "requests": concurrent_requests,
+            "in_memory_total_ms": round(baseline_concurrent * 1000, 3),
+            "sql_aggregate_total_ms": round(sql_concurrent * 1000, 3),
+        },
+    }
 
 # API Endpoints
 @app.on_event("startup")
@@ -423,10 +367,12 @@ async def get_care_stats(
     return await get_daily_care_stats_optimized(db, tenant_id, facility_id_list, start, end)
 
 @app.post("/api/run-performance-test")
-async def run_perf_test():
-    """Run performance comparison test."""
-    await run_performance_test()
-    return {"message": "Performance test completed. Check console for results."}
+async def run_perf_test(
+    iterations: int = Query(default=10, ge=1, le=50),
+    concurrency: int = Query(default=5, ge=1, le=20),
+):
+    """Compare the in-memory baseline with SQL aggregation and return the timings."""
+    return await run_performance_test(iterations, concurrency)
 
 @app.get("/api/care-notes")
 async def get_care_notes(

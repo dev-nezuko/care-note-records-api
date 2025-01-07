@@ -1,7 +1,9 @@
+import random
 import unittest
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import httpx
+from sqlalchemy import func, select
 
 import testing_db  # noqa: F401  (must precede the app import)
 import main  # noqa: E402
@@ -95,6 +97,66 @@ class CareStatsTests(ApiTestCase):
             with self.subTest(params=params):
                 response = await self.stats(tenant_id=1, **params)
                 self.assertEqual(response.status_code, 400)
+
+
+class SeedingTests(ApiTestCase):
+    async def notes(self):
+        async with main.async_session_maker() as db:
+            return (await db.execute(select(main.CareNote).order_by(main.CareNote.id))).scalars().all()
+
+    async def test_seeding_spans_several_batches_in_one_transaction(self):
+        await main.create_test_data(main.SEED_BATCH_SIZE * 2 + 5, random.Random(1))
+        async with main.async_session_maker() as db:
+            total = await db.scalar(select(func.count()).select_from(main.CareNote))
+        self.assertEqual(total, len(FIXTURE_NOTES) + main.SEED_BATCH_SIZE * 2 + 5)
+
+    async def test_seeded_values_are_fictional_and_in_range(self):
+        await main.create_test_data(200, random.Random(7))
+        seeded = (await self.notes())[len(FIXTURE_NOTES):]
+        cutoff = datetime.utcnow() - timedelta(days=31)
+        for note in seeded:
+            self.assertTrue(note.patient_id.startswith('DEMO-P'))
+            self.assertTrue(note.created_by.startswith('demo-carer-'))
+            self.assertIn(note.category, main.DEMO_CATEGORIES)
+            self.assertIn(note.priority, range(1, 6))
+            self.assertEqual(note.facility_id // 10, note.tenant_id)
+            self.assertGreater(note.created_at, cutoff)
+
+    async def test_a_random_seed_reproduces_the_same_notes(self):
+        await main.create_test_data(20, random.Random(42))
+        first = [(n.patient_id, n.category, n.priority) for n in (await self.notes())[len(FIXTURE_NOTES):]]
+        await main.create_test_data(20, random.Random(42))
+        second = [(n.patient_id, n.category, n.priority) for n in (await self.notes())[len(FIXTURE_NOTES) + 20:]]
+        self.assertEqual(first, second)
+
+
+class PerformanceTestEndpointTests(ApiTestCase):
+    async def test_both_paths_count_the_same_day_and_agree(self):
+        day = (datetime.utcnow() - timedelta(days=5)).replace(hour=0, minute=0, second=0, microsecond=0)
+        async with main.async_session_maker() as db:
+            for hour, facility_id in [(0, 11), (12, 12), (23, 15)]:
+                db.add(main.CareNote(tenant_id=1, facility_id=facility_id, patient_id='fictional-d',
+                                     category='treatment', priority=4, created_by='fictional-carer',
+                                     note_content='Benchmark fixture', created_at=day + timedelta(hours=hour)))
+            db.add(main.CareNote(tenant_id=1, facility_id=11, patient_id='fictional-d', category='treatment',
+                                 priority=4, created_by='fictional-carer', note_content='Next day',
+                                 created_at=day + timedelta(days=1)))
+            await db.commit()
+
+        response = await self.client.post('/api/run-performance-test', params={'iterations': 2, 'concurrency': 2})
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body['day'], day.date().isoformat())
+        self.assertEqual(body['notes_in_window'], 3)
+        self.assertTrue(body['results_match'])
+        self.assertEqual(body['sequential']['iterations'], 2)
+        self.assertEqual(body['concurrent']['requests'], 2)
+
+    async def test_run_size_is_bounded(self):
+        for params in [{'iterations': 0}, {'iterations': 51}, {'concurrency': 0}, {'concurrency': 21}]:
+            with self.subTest(params=params):
+                response = await self.client.post('/api/run-performance-test', params=params)
+                self.assertEqual(response.status_code, 422)
 
 
 def tearDownModule():
