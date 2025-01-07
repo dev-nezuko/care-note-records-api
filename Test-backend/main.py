@@ -4,12 +4,11 @@ from sqlalchemy.engine import URL
 import os
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy.orm import Session, DeclarativeBase, Mapped, mapped_column, sessionmaker
-from datetime import datetime, timedelta, date
-from typing import List, Optional, Dict, Any
+from datetime import datetime, timedelta, date, timezone
+from typing import List, Optional, Dict, Any, Tuple
 import asyncio
 import random
 import time
-from concurrent.futures import ThreadPoolExecutor
 from fastapi.middleware.cors import CORSMiddleware
 
 # Base Models
@@ -184,25 +183,17 @@ async def get_daily_care_stats_optimized(
     start_date: Optional[datetime] = None,
     end_date: Optional[datetime] = None
 ) -> Dict[str, Any]:
-    """Aggregate counts in SQL rather than loading every matching note."""
-    if start_date is None:
-        start_date = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
-    if end_date is None:
-        end_date = datetime.utcnow().replace(hour=23, minute=59, second=59, microsecond=999999)
+    """Aggregate counts in SQL rather than loading every matching note.
 
-    print(f"Calculating stats for tenant {tenant_id}, facilities {facility_ids}, date range: {start_date} to {end_date}")
-
-    # Build base filter conditions
-    filters = [
-        CareNote.tenant_id == tenant_id,
-        CareNote.created_at >= start_date,
-        CareNote.created_at <= end_date
-    ]
-
+    A missing bound leaves that side of the range open (used by ``all_time``).
+    """
+    filters = [CareNote.tenant_id == tenant_id]
+    if start_date is not None:
+        filters.append(CareNote.created_at >= start_date)
+    if end_date is not None:
+        filters.append(CareNote.created_at <= end_date)
     if facility_ids:
         filters.append(CareNote.facility_id.in_(facility_ids))
-
-    print(f"Using filters: {filters}")
 
     # Multiple optimized queries (SQLite doesn't support GROUPING SETS)
     # Get total count and unique patients
@@ -214,7 +205,6 @@ async def get_daily_care_stats_optimized(
         .where(and_(*filters))
     )
     total_result = (await db.execute(total_query)).first()
-    print(f"Total query result: {total_result}")
 
     # Get counts by category
     category_query = (
@@ -226,7 +216,6 @@ async def get_daily_care_stats_optimized(
         .group_by(CareNote.category)
     )
     category_results = (await db.execute(category_query)).all()
-    print(f"Category results: {category_results}")
 
     # Get counts by priority
     priority_query = (
@@ -238,7 +227,6 @@ async def get_daily_care_stats_optimized(
         .group_by(CareNote.priority)
     )
     priority_results = (await db.execute(priority_query)).all()
-    print(f"Priority results: {priority_results}")
 
     # Get counts by facility
     facility_query = (
@@ -250,7 +238,6 @@ async def get_daily_care_stats_optimized(
         .group_by(CareNote.facility_id)
     )
     facility_results = (await db.execute(facility_query)).all()
-    print(f"Facility results: {facility_results}")
 
     # Build stats
     stats = {
@@ -260,8 +247,8 @@ async def get_daily_care_stats_optimized(
         "by_facility": {row.facility_id: row.count for row in facility_results},
         "avg_notes_per_patient": 0,
         "date_range": {
-            "start": start_date.isoformat(),
-            "end": end_date.isoformat()
+            "start": start_date.isoformat() if start_date else None,
+            "end": end_date.isoformat() if end_date else None
         }
     }
 
@@ -273,7 +260,6 @@ async def get_daily_care_stats_optimized(
     if total_result.unique_patients and total_result.unique_patients > 0:
         stats["avg_notes_per_patient"] = round(stats["total_notes"] / total_result.unique_patients, 2)
 
-    print(f"Returning stats: {stats}")
     return stats
 
 # Performance testing function
@@ -362,65 +348,79 @@ async def run_performance_test(num_iterations: int = 10, concurrent_requests: in
 async def startup_event():
     init_db()
 
+def parse_facility_ids(raw: Optional[str]) -> Optional[List[int]]:
+    """Parse a comma-separated facility filter; an absent or empty value means no filter."""
+    if not raw:
+        return None
+    try:
+        facility_ids = [int(value.strip()) for value in raw.split(',') if value.strip()]
+        if not facility_ids or any(value < 1 for value in facility_ids):
+            raise ValueError
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Facility IDs must be positive integers")
+    return facility_ids
+
+
+def parse_range_bound(value: str, end_of_day: bool) -> datetime:
+    """Parse an ISO date or datetime into the naive-UTC form the notes are stored in.
+
+    A bare date as the end bound covers that whole day, so
+    ``start_date=2026-11-01&end_date=2026-11-01`` returns the notes of 1 November.
+    """
+    try:
+        if len(value) == 10:
+            day = date.fromisoformat(value)
+            if end_of_day:
+                return datetime.combine(day, datetime.max.time())
+            return datetime.combine(day, datetime.min.time())
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid date format")
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+    return parsed
+
+
+def resolve_date_range(
+    range_name: str, start_date: Optional[str], end_date: Optional[str], now: datetime
+) -> Tuple[Optional[datetime], Optional[datetime]]:
+    if (start_date is None) != (end_date is None):
+        raise HTTPException(status_code=400, detail="start_date and end_date must be supplied together")
+    if start_date is not None:
+        start = parse_range_bound(start_date, end_of_day=False)
+        end = parse_range_bound(end_date, end_of_day=True)
+        if start > end:
+            raise HTTPException(status_code=400, detail="start_date must not be after end_date")
+        return start, end
+
+    midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    end_of_today = now.replace(hour=23, minute=59, second=59, microsecond=999999)
+    if range_name == "today":
+        return midnight, end_of_today
+    if range_name == "this_week":
+        return midnight - timedelta(days=now.weekday()), end_of_today
+    if range_name == "this_month":
+        return midnight.replace(day=1), end_of_today
+    if range_name == "this_year":
+        return midnight.replace(month=1, day=1), end_of_today
+    if range_name == "all_time":
+        return None, None
+    raise HTTPException(status_code=400, detail="Invalid date range")
+
+
 @app.get("/api/care-stats")
 async def get_care_stats(
     tenant_id: int,
     facility_ids: Optional[str] = None,
-    range: str = "today",
+    range_name: str = Query(default="today", alias="range"),
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
-    optimized: bool = True,
     db: AsyncSession = Depends(get_db)
 ):
     """Get care statistics for a tenant within a date range."""
-    print(f"Received stats request - tenant_id: {tenant_id}, facility_ids: {facility_ids}, range: {range}")
-
-    # Parse facility IDs
-    facility_id_list = None
-    if facility_ids:
-        try:
-            facility_id_list = [int(x.strip()) for x in facility_ids.split(",") if x.strip()]
-            print(f"Parsed facility IDs: {facility_id_list}")
-        except ValueError as e:
-            print(f"Error parsing facility IDs: {e}")
-            raise HTTPException(status_code=400, detail="Invalid facility IDs format")
-
-    # Calculate date range
-    now = datetime.utcnow()
-    start = None
-    end = None
-
-    if start_date and end_date:
-        # Use custom date range if provided
-        try:
-            start = datetime.fromisoformat(start_date)
-            end = datetime.fromisoformat(end_date)
-        except ValueError as e:
-            raise HTTPException(status_code=400, detail="Invalid date format")
-    else:
-        # Use predefined ranges
-        end = now.replace(hour=23, minute=59, second=59, microsecond=999999)
-        if range == "today":
-            start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-        elif range == "this_week":
-            start = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
-        elif range == "this_month":
-            start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-        elif range == "this_year":
-            start = now.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
-        elif range == "all_time":
-            start = datetime.min
-            end = datetime.max
-        else:
-            raise HTTPException(status_code=400, detail="Invalid date range")
-
-    try:
-        stats = await get_daily_care_stats_optimized(db, tenant_id, facility_id_list, start, end)
-        print(f"Returning stats response: {stats}")
-        return stats
-    except Exception as e:
-        print(f"Error getting stats: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    facility_id_list = parse_facility_ids(facility_ids)
+    start, end = resolve_date_range(range_name, start_date, end_date, datetime.utcnow())
+    return await get_daily_care_stats_optimized(db, tenant_id, facility_id_list, start, end)
 
 @app.post("/api/run-performance-test")
 async def run_perf_test():
@@ -447,13 +447,8 @@ async def get_care_notes(
     if tenant_id is not None:
         query = query.where(CareNote.tenant_id == tenant_id)
 
-    if facility_ids:
-        try:
-            facility_id_list = [int(value.strip()) for value in facility_ids.split(',') if value.strip()]
-            if not facility_id_list or any(value < 1 for value in facility_id_list):
-                raise ValueError
-        except ValueError:
-            raise HTTPException(status_code=400, detail="Facility IDs must be positive integers")
+    facility_id_list = parse_facility_ids(facility_ids)
+    if facility_id_list:
         query = query.where(CareNote.facility_id.in_(facility_id_list))
 
     # Add pagination
@@ -467,7 +462,7 @@ async def get_care_notes(
     count_query = select(func.count()).select_from(CareNote)
     if tenant_id is not None:
         count_query = count_query.where(CareNote.tenant_id == tenant_id)
-    if facility_ids:
+    if facility_id_list:
         count_query = count_query.where(CareNote.facility_id.in_(facility_id_list))
 
     total_count = await db.scalar(count_query)

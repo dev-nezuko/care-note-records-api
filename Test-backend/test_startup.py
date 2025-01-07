@@ -1,16 +1,12 @@
-import os
-import tempfile
 import unittest
 from datetime import datetime
-from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import httpx
 from sqlalchemy import func, select
 
-_directory = tempfile.TemporaryDirectory(prefix='care-notes-tests-')
-os.environ['CARE_NOTES_DB_PATH'] = str(Path(_directory.name) / 'test.db')
-import main
+import testing_db  # noqa: F401  (must precede the app import)
+import main  # noqa: E402
 
 
 class StartupAndInputTests(unittest.IsolatedAsyncioTestCase):
@@ -65,7 +61,6 @@ class StartupAndInputTests(unittest.IsolatedAsyncioTestCase):
 
 def tearDownModule():
     main.sync_engine.dispose()
-    _directory.cleanup()
 
 
 if __name__ == '__main__':
