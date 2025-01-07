@@ -5,12 +5,13 @@ import os
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy.orm import Session, DeclarativeBase, Mapped, mapped_column, sessionmaker
 from datetime import datetime, timedelta, date, timezone
-from typing import List, Optional, Dict, Any, Tuple
+from typing import List, Literal, Optional, Dict, Any, Tuple
 import asyncio
 import logging
 import random
 import time
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +36,55 @@ class CareNote(Base):
         Index('idx_tenant_facility_date', 'tenant_id', 'facility_id', 'created_at'),
         Index('idx_tenant_date_category', 'tenant_id', 'created_at', 'category'),
     )
+
+class CareNoteCreate(BaseModel):
+    """Fields a client may set; ``id`` is always assigned by the database."""
+
+    model_config = ConfigDict(extra='forbid')
+
+    tenant_id: int = Field(default=1, ge=1)
+    facility_id: int = Field(default=1, ge=1)
+    patient_id: str = Field(min_length=1, max_length=64)
+    category: Literal['medication', 'observation', 'treatment']
+    priority: int = Field(ge=1, le=5)
+    created_by: str = Field(min_length=1, max_length=64)
+    note_content: str = Field(min_length=1, max_length=10_000)
+    created_at: Optional[datetime] = None
+
+    @field_validator('created_at')
+    @classmethod
+    def store_as_naive_utc(cls, value: Optional[datetime]) -> Optional[datetime]:
+        # Notes are stored as naive UTC; an offset would otherwise be silently dropped.
+        if value is not None and value.tzinfo is not None:
+            return value.astimezone(timezone.utc).replace(tzinfo=None)
+        return value
+
+
+class CareNoteRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    tenant_id: int
+    facility_id: int
+    patient_id: str
+    category: str
+    priority: int
+    created_at: datetime
+    created_by: str
+    note_content: str
+
+
+class Pagination(BaseModel):
+    total: int
+    page: int
+    page_size: int
+    total_pages: int
+
+
+class CareNotePage(BaseModel):
+    notes: List[CareNoteRead]
+    pagination: Pagination
+
 
 # Database setup
 DATABASE_FILE = os.getenv("CARE_NOTES_DB_PATH", "carenotes.db")
@@ -374,7 +424,7 @@ async def run_perf_test(
     """Compare the in-memory baseline with SQL aggregation and return the timings."""
     return await run_performance_test(iterations, concurrency)
 
-@app.get("/api/care-notes")
+@app.get("/api/care-notes", response_model=CareNotePage)
 async def get_care_notes(
     tenant_id: Optional[int] = None,
     facility_ids: Optional[str] = None,
@@ -387,7 +437,8 @@ async def get_care_notes(
     offset = (page - 1) * page_size
 
     # Build base query
-    query = select(CareNote).order_by(CareNote.created_at.desc())
+    # id breaks timestamp ties so a note never shows up on two pages.
+    query = select(CareNote).order_by(CareNote.created_at.desc(), CareNote.id.desc())
 
     # Add filters
     if tenant_id is not None:
@@ -424,18 +475,17 @@ async def get_care_notes(
         }
     }
 
-@app.post("/api/care-notes")
+@app.post("/api/care-notes", response_model=CareNoteRead, status_code=201)
 async def create_care_note(
-    note: dict,
+    note: CareNoteCreate,
     db: AsyncSession = Depends(get_db)
 ):
-    """Create a new care note."""
-    # Set defaults if not provided
-    note.setdefault('tenant_id', 1)
-    note.setdefault('facility_id', 1)
-    note.setdefault('created_at', datetime.utcnow())
+    """Create a care note; ``created_at`` defaults to the current UTC time."""
+    fields = note.model_dump()
+    if fields['created_at'] is None:
+        fields['created_at'] = datetime.utcnow()
 
-    db_note = CareNote(**note)
+    db_note = CareNote(**fields)
     db.add(db_note)
     await db.commit()
     await db.refresh(db_note)

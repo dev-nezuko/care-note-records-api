@@ -159,6 +159,61 @@ class PerformanceTestEndpointTests(ApiTestCase):
                 self.assertEqual(response.status_code, 422)
 
 
+VALID_NOTE = {
+    'tenant_id': 1,
+    'facility_id': 12,
+    'patient_id': 'fictional-e',
+    'category': 'observation',
+    'priority': 2,
+    'created_by': 'fictional-carer',
+    'note_content': 'Ate a full breakfast; no concerns.',
+}
+
+
+class CareNoteTests(ApiTestCase):
+    async def test_created_note_is_returned_and_listed(self):
+        response = await self.client.post('/api/care-notes', json=VALID_NOTE)
+        self.assertEqual(response.status_code, 201)
+        created = response.json()
+        self.assertIsInstance(created['id'], int)
+        self.assertEqual({k: created[k] for k in VALID_NOTE}, VALID_NOTE)
+
+        listing = await self.client.get('/api/care-notes', params={'tenant_id': 1, 'facility_ids': '12'})
+        self.assertEqual([note['id'] for note in listing.json()['notes']][0], created['id'])
+
+    async def test_json_timestamps_with_offsets_are_stored_in_utc(self):
+        response = await self.client.post('/api/care-notes',
+                                          json={**VALID_NOTE, 'created_at': '2026-03-04T10:00:00+02:00'})
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.json()['created_at'], '2026-03-04T08:00:00')
+
+    async def test_invalid_notes_are_rejected_before_reaching_the_database(self):
+        cases = {
+            'unknown field': {**VALID_NOTE, 'diagnosis': 'x'},
+            'client id': {**VALID_NOTE, 'id': 99},
+            'bad category': {**VALID_NOTE, 'category': 'gossip'},
+            'priority too high': {**VALID_NOTE, 'priority': 6},
+            'priority too low': {**VALID_NOTE, 'priority': 0},
+            'empty content': {**VALID_NOTE, 'note_content': ''},
+            'missing patient': {k: v for k, v in VALID_NOTE.items() if k != 'patient_id'},
+            'bad timestamp': {**VALID_NOTE, 'created_at': 'yesterday'},
+        }
+        for label, body in cases.items():
+            with self.subTest(label):
+                response = await self.client.post('/api/care-notes', json=body)
+                self.assertEqual(response.status_code, 422)
+        listing = await self.client.get('/api/care-notes')
+        self.assertEqual(listing.json()['pagination']['total'], len(FIXTURE_NOTES))
+
+    async def test_pages_are_newest_first_and_do_not_overlap(self):
+        first = (await self.client.get('/api/care-notes', params={'page_size': 3})).json()
+        second = (await self.client.get('/api/care-notes', params={'page_size': 3, 'page': 2})).json()
+        self.assertEqual(first['pagination'], {'total': 4, 'page': 1, 'page_size': 3, 'total_pages': 2})
+        timestamps = [note['created_at'] for note in first['notes'] + second['notes']]
+        self.assertEqual(timestamps, sorted(timestamps, reverse=True))
+        self.assertEqual(len({note['id'] for note in first['notes'] + second['notes']}), 4)
+
+
 def tearDownModule():
     main.sync_engine.dispose()
 
