@@ -1,16 +1,17 @@
-version: '3.8'
-
 services:
-  postgres:
-    image: postgres:15-alpine
-    environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: change-me
-      POSTGRES_DB: carenotes
+  api:
+    build: .
     ports:
-      - "5432:5432"
+      - "${API_PORT:-8000}:8000"
+    environment:
+      CARE_NOTES_CORS_ORIGINS: ${CARE_NOTES_CORS_ORIGINS:-http://localhost:3000}
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      - notes-data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/openapi.json')"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
 
 volumes:
-  postgres_data:
+  notes-data:
