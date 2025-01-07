@@ -1,7 +1,14 @@
 # Backend quick reference
 
 The application is `main:app`. Run commands from this directory so the default
-SQLite file and imports have a predictable location.
+SQLite file and imports resolve predictably.
+
+```sh
+docker compose up -d --build --wait
+docker compose run --rm api python seed_demo.py --notes 1000
+```
+
+or, without Docker (Python 3.12):
 
 ```sh
 python -m pip install -r requirements.txt
@@ -9,20 +16,20 @@ python seed_demo.py --notes 1000
 python -m uvicorn main:app --reload
 ```
 
-Startup creates missing tables and preserves existing notes. Seeding is explicit;
-only the seeder's `--reset` option drops existing tables. `CARE_NOTES_DB_PATH`
-selects a different SQLite database file for both sync and async connections.
-
-The actual endpoints are documented at `/docs`: list/create care notes, care
-statistics and an illustrative benchmark trigger. Tenant/facility parameters are
-filters rather than an authorization boundary.
-
-For an isolated startup/input regression check:
+Tests and lint:
 
 ```sh
-python -m pip install -r requirements-test.txt
-python -m unittest -v test_startup
+python -m pip install -r requirements-dev.txt
+python -m unittest discover -v
+ruff check . && ruff format --check .
 ```
 
-See the [project README](../README.md) for API examples, architecture, reset
-semantics and limitations. Keep demonstration records synthetic.
+| File | Contents |
+| --- | --- |
+| `main.py` | Model, request/response schemas, routes, seeder and benchmark |
+| `seed_demo.py` | CLI that appends synthetic notes (`--reset` drops the table first) |
+| `test_api.py`, `test_startup.py` | API, seeding and startup tests |
+| `testing_db.py` | Points the tests at a temporary SQLite file |
+
+See the [project README](../README.md) for API examples, settings, design
+notes and limitations. Keep demonstration records synthetic.
