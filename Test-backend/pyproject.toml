@@ -1,0 +1,20 @@
+[project]
+name = "care-note-records-api"
+version = "0.1.0"
+description = "FastAPI + SQLite demo comparing in-memory counting with SQL aggregation over synthetic care notes"
+requires-python = ">=3.12,<3.13"
+
+[tool.ruff]
+line-length = 110
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "DTZ003", "DTZ004"]
+# FastAPI's dependency injection relies on calls in argument defaults.
+ignore = ["B008"]
+
+[tool.ruff.lint.isort]
+force-sort-within-sections = false
+
+[tool.ruff.format]
+quote-style = "preserve"

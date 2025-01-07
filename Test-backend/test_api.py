@@ -6,18 +6,44 @@ import httpx
 from sqlalchemy import func, select
 
 import testing_db  # noqa: F401  (must precede the app import)
-import main  # noqa: E402
+
+# isort: split
+import main
 
 # Fixed timestamps keep the date-range assertions independent of the clock.
 FIXTURE_NOTES = [
-    dict(tenant_id=1, facility_id=11, patient_id='fictional-a', category='medication', priority=1,
-         created_at=datetime(2026, 3, 2, 8, 0)),
-    dict(tenant_id=1, facility_id=11, patient_id='fictional-a', category='observation', priority=3,
-         created_at=datetime(2026, 3, 2, 23, 30)),
-    dict(tenant_id=1, facility_id=12, patient_id='fictional-b', category='observation', priority=5,
-         created_at=datetime(2026, 3, 3, 12, 0)),
-    dict(tenant_id=2, facility_id=21, patient_id='fictional-c', category='treatment', priority=2,
-         created_at=datetime(2026, 3, 2, 9, 0)),
+    dict(
+        tenant_id=1,
+        facility_id=11,
+        patient_id='fictional-a',
+        category='medication',
+        priority=1,
+        created_at=datetime(2026, 3, 2, 8, 0),
+    ),
+    dict(
+        tenant_id=1,
+        facility_id=11,
+        patient_id='fictional-a',
+        category='observation',
+        priority=3,
+        created_at=datetime(2026, 3, 2, 23, 30),
+    ),
+    dict(
+        tenant_id=1,
+        facility_id=12,
+        patient_id='fictional-b',
+        category='observation',
+        priority=5,
+        created_at=datetime(2026, 3, 3, 12, 0),
+    ),
+    dict(
+        tenant_id=2,
+        facility_id=21,
+        patient_id='fictional-c',
+        category='treatment',
+        priority=2,
+        created_at=datetime(2026, 3, 2, 9, 0),
+    ),
 ]
 
 
@@ -27,7 +53,9 @@ class ApiTestCase(unittest.IsolatedAsyncioTestCase):
         main.init_db()
         async with main.async_session_maker() as db:
             for fields in FIXTURE_NOTES:
-                db.add(main.CareNote(created_by='fictional-carer', note_content='Synthetic fixture', **fields))
+                db.add(
+                    main.CareNote(created_by='fictional-carer', note_content='Synthetic fixture', **fields)
+                )
             await db.commit()
         self.client = httpx.AsyncClient(transport=httpx.ASGITransport(app=main.app), base_url='http://test')
 
@@ -57,8 +85,9 @@ class CareStatsTests(ApiTestCase):
 
     async def test_offset_timestamps_are_converted_to_utc(self):
         # 2026-03-03T01:00+02:00 is 2026-03-02T23:00Z, so only the 23:30 note is after it.
-        response = await self.stats(tenant_id=1, start_date='2026-03-03T01:00:00+02:00',
-                                    end_date='2026-03-02T23:59:00')
+        response = await self.stats(
+            tenant_id=1, start_date='2026-03-03T01:00:00+02:00', end_date='2026-03-02T23:59:00'
+        )
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()['total_notes'], 1)
 
@@ -112,8 +141,8 @@ class SeedingTests(ApiTestCase):
 
     async def test_seeded_values_are_fictional_and_in_range(self):
         await main.create_test_data(200, random.Random(7))
-        seeded = (await self.notes())[len(FIXTURE_NOTES):]
-        cutoff = datetime.utcnow() - timedelta(days=31)
+        seeded = (await self.notes())[len(FIXTURE_NOTES) :]
+        cutoff = main.utc_now() - timedelta(days=31)
         for note in seeded:
             self.assertTrue(note.patient_id.startswith('DEMO-P'))
             self.assertTrue(note.created_by.startswith('demo-carer-'))
@@ -124,26 +153,48 @@ class SeedingTests(ApiTestCase):
 
     async def test_a_random_seed_reproduces_the_same_notes(self):
         await main.create_test_data(20, random.Random(42))
-        first = [(n.patient_id, n.category, n.priority) for n in (await self.notes())[len(FIXTURE_NOTES):]]
+        first = [(n.patient_id, n.category, n.priority) for n in (await self.notes())[len(FIXTURE_NOTES) :]]
         await main.create_test_data(20, random.Random(42))
-        second = [(n.patient_id, n.category, n.priority) for n in (await self.notes())[len(FIXTURE_NOTES) + 20:]]
+        second = [
+            (n.patient_id, n.category, n.priority) for n in (await self.notes())[len(FIXTURE_NOTES) + 20 :]
+        ]
         self.assertEqual(first, second)
 
 
 class PerformanceTestEndpointTests(ApiTestCase):
     async def test_both_paths_count_the_same_day_and_agree(self):
-        day = (datetime.utcnow() - timedelta(days=5)).replace(hour=0, minute=0, second=0, microsecond=0)
+        day = (main.utc_now() - timedelta(days=5)).replace(hour=0, minute=0, second=0, microsecond=0)
         async with main.async_session_maker() as db:
             for hour, facility_id in [(0, 11), (12, 12), (23, 15)]:
-                db.add(main.CareNote(tenant_id=1, facility_id=facility_id, patient_id='fictional-d',
-                                     category='treatment', priority=4, created_by='fictional-carer',
-                                     note_content='Benchmark fixture', created_at=day + timedelta(hours=hour)))
-            db.add(main.CareNote(tenant_id=1, facility_id=11, patient_id='fictional-d', category='treatment',
-                                 priority=4, created_by='fictional-carer', note_content='Next day',
-                                 created_at=day + timedelta(days=1)))
+                db.add(
+                    main.CareNote(
+                        tenant_id=1,
+                        facility_id=facility_id,
+                        patient_id='fictional-d',
+                        category='treatment',
+                        priority=4,
+                        created_by='fictional-carer',
+                        note_content='Benchmark fixture',
+                        created_at=day + timedelta(hours=hour),
+                    )
+                )
+            db.add(
+                main.CareNote(
+                    tenant_id=1,
+                    facility_id=11,
+                    patient_id='fictional-d',
+                    category='treatment',
+                    priority=4,
+                    created_by='fictional-carer',
+                    note_content='Next day',
+                    created_at=day + timedelta(days=1),
+                )
+            )
             await db.commit()
 
-        response = await self.client.post('/api/run-performance-test', params={'iterations': 2, 'concurrency': 2})
+        response = await self.client.post(
+            '/api/run-performance-test', params={'iterations': 2, 'concurrency': 2}
+        )
         self.assertEqual(response.status_code, 200)
         body = response.json()
         self.assertEqual(body['day'], day.date().isoformat())
@@ -182,8 +233,9 @@ class CareNoteTests(ApiTestCase):
         self.assertEqual([note['id'] for note in listing.json()['notes']][0], created['id'])
 
     async def test_json_timestamps_with_offsets_are_stored_in_utc(self):
-        response = await self.client.post('/api/care-notes',
-                                          json={**VALID_NOTE, 'created_at': '2026-03-04T10:00:00+02:00'})
+        response = await self.client.post(
+            '/api/care-notes', json={**VALID_NOTE, 'created_at': '2026-03-04T10:00:00+02:00'}
+        )
         self.assertEqual(response.status_code, 201)
         self.assertEqual(response.json()['created_at'], '2026-03-04T08:00:00')
 
