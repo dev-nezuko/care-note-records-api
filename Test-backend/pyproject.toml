@@ -13,8 +13,5 @@ select = ["E", "F", "W", "I", "B", "UP", "DTZ003", "DTZ004"]
 # FastAPI's dependency injection relies on calls in argument defaults.
 ignore = ["B008"]
 
-[tool.ruff.lint.isort]
-force-sort-within-sections = false
-
 [tool.ruff.format]
 quote-style = "preserve"

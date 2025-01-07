@@ -1,4 +1,4 @@
-fastapi==0.104.1
-uvicorn[standard]==0.24.0
-sqlalchemy[asyncio]==2.0.31
-aiosqlite==0.20.0
+fastapi==0.162.2
+uvicorn[standard]==0.54.0
+sqlalchemy[asyncio]==2.1.8
+aiosqlite==0.22.1
